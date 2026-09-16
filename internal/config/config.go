@@ -11,6 +11,7 @@ type Config struct {
 	Address        string
 	DatabaseURI    string
 	AccrualAddress string
+	AuthSecret     string
 }
 
 // Load читает параметры из переменных окружения и флагов командной строки.
@@ -19,11 +20,13 @@ func Load() Config {
 		Address:        getenv("RUN_ADDRESS", "localhost:8080"),
 		DatabaseURI:    getenv("DATABASE_URI", ""),
 		AccrualAddress: getenv("ACCRUAL_SYSTEM_ADDRESS", ""),
+		AuthSecret:     getenv("AUTH_SECRET", ""),
 	}
 
 	flag.StringVar(&cfg.Address, "a", cfg.Address, "address to bind the HTTP server to")
 	flag.StringVar(&cfg.DatabaseURI, "d", cfg.DatabaseURI, "database connection URI")
 	flag.StringVar(&cfg.AccrualAddress, "r", cfg.AccrualAddress, "accrual system base address")
+	flag.StringVar(&cfg.AuthSecret, "s", cfg.AuthSecret, "secret for authentication")
 	flag.Parse()
 
 	if cfg.AccrualAddress != "" && !strings.Contains(cfg.AccrualAddress, "://") {

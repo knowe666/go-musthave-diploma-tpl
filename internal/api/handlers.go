@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/knowe666/internal/accrual"
-	"github.com/knowe666/internal/auth"
-	"github.com/knowe666/internal/storage"
+	"github.com/knowe666/go-musthave-diploma-tpl/internal/accrual"
+	"github.com/knowe666/go-musthave-diploma-tpl/internal/auth"
+	"github.com/knowe666/go-musthave-diploma-tpl/internal/storage"
 	"golang.org/x/crypto/bcrypt"
 )
 

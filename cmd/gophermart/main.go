@@ -4,11 +4,11 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/knowe666/internal/accrual"
-	"github.com/knowe666/internal/api"
-	"github.com/knowe666/internal/auth"
-	"github.com/knowe666/internal/config"
-	"github.com/knowe666/internal/storage"
+	"github.com/knowe666/go-musthave-diploma-tpl/internal/accrual"
+	"github.com/knowe666/go-musthave-diploma-tpl/internal/api"
+	"github.com/knowe666/go-musthave-diploma-tpl/internal/auth"
+	"github.com/knowe666/go-musthave-diploma-tpl/internal/config"
+	"github.com/knowe666/go-musthave-diploma-tpl/internal/storage"
 )
 
 func main() {
@@ -18,6 +18,9 @@ func main() {
 	}
 	if cfg.AccrualAddress == "" {
 		log.Fatal("ACCRUAL_SYSTEM_ADDRESS must be set")
+	}
+	if cfg.AuthSecret == "" {
+		log.Fatal("AUTH_SECRET must be set")
 	}
 
 	db, err := storage.Open(cfg.DatabaseURI)
@@ -31,7 +34,7 @@ func main() {
 		log.Fatalf("init database: %v", err)
 	}
 
-	service := api.New(store, auth.New("gophermart-auth-secret"), accrual.New(cfg.AccrualAddress))
+	service := api.New(store, auth.New(cfg.AuthSecret), accrual.New(cfg.AccrualAddress))
 	go service.SyncPendingOrders()
 
 	log.Printf("starting gophermart on %s", cfg.Address)
