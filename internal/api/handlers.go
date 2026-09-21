@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -48,20 +49,50 @@ func (s *Service) Router() http.Handler {
 }
 
 // SyncPendingOrders опрашивает сервис начисления баллов на предмет заказов, которые все еще ожидают обработки.
-func (s *Service) SyncPendingOrders() {
+func (s *Service) SyncPendingOrders(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		orders, err := s.Store.PendingOrders()
+	var nextAccrualRequest time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		orders, err := s.Store.PendingOrders(ctx)
 		if err != nil {
 			log.Printf("query pending orders: %v", err)
 			continue
 		}
 		for _, number := range orders {
-			if err := s.syncOrderStatus(number); err != nil {
+			if !waitForAccrual(ctx, nextAccrualRequest) {
+				return
+			}
+			err := s.syncOrderStatus(ctx, number)
+			if err != nil {
 				log.Printf("sync order %s: %v", number, err)
+				var rateLimitErr *accrual.RateLimitError
+				if errors.As(err, &rateLimitErr) && rateLimitErr.RetryAfter > 0 {
+					nextAccrualRequest = time.Now().Add(rateLimitErr.RetryAfter)
+				}
 			}
 		}
+	}
+}
+
+func waitForAccrual(ctx context.Context, deadline time.Time) bool {
+	delay := time.Until(deadline)
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -71,12 +102,12 @@ func (s *Service) handleOrderSubmitChi(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	user, err := s.Store.UserByID(userID)
+	user, err := s.Store.UserByID(r.Context(), userID)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	s.handleOrderSubmit(w, r, user)
+	s.handleOrderSubmit(r.Context(), w, r, user)
 }
 
 func (s *Service) handleOrderListChi(w http.ResponseWriter, r *http.Request) {
@@ -85,12 +116,12 @@ func (s *Service) handleOrderListChi(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	user, err := s.Store.UserByID(userID)
+	user, err := s.Store.UserByID(r.Context(), userID)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	s.handleOrderList(w, user)
+	s.handleOrderList(r.Context(), w, user)
 }
 
 func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +138,7 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.Store.UserByLogin(request.Login); err == nil {
+	if _, err := s.Store.UserByLogin(r.Context(), request.Login); err == nil {
 		http.Error(w, "login already exists", http.StatusConflict)
 		return
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -124,7 +155,7 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := auth.GenerateUserID()
-	if err := s.Store.CreateUser(userID, request.Login, string(hash)); err != nil {
+	if err := s.Store.CreateUser(r.Context(), userID, request.Login, string(hash)); err != nil {
 		log.Printf("create user: %v", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
@@ -148,7 +179,7 @@ func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.Store.UserByLogin(request.Login)
+	user, err := s.Store.UserByLogin(r.Context(), request.Login)
 	if errors.Is(err, sql.ErrNoRows) || err != nil && user == nil {
 		http.Error(w, "invalid login or password", http.StatusUnauthorized)
 		return
@@ -173,7 +204,7 @@ func (s *Service) handleOrders(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	user, err := s.Store.UserByID(userID)
+	user, err := s.Store.UserByID(r.Context(), userID)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -181,15 +212,15 @@ func (s *Service) handleOrders(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
-		s.handleOrderSubmit(w, r, user)
+		s.handleOrderSubmit(r.Context(), w, r, user)
 	case http.MethodGet:
-		s.handleOrderList(w, user)
+		s.handleOrderList(r.Context(), w, user)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Service) handleOrderSubmit(w http.ResponseWriter, r *http.Request, user *storage.User) {
+func (s *Service) handleOrderSubmit(ctx context.Context, w http.ResponseWriter, r *http.Request, user *storage.User) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -201,7 +232,7 @@ func (s *Service) handleOrderSubmit(w http.ResponseWriter, r *http.Request, user
 		return
 	}
 
-	foundUserID, _, err := s.Store.FindOrderByNumber(orderNumber)
+	foundUserID, _, err := s.Store.FindOrderByNumber(ctx, orderNumber)
 	if err == nil {
 		if foundUserID == user.ID {
 			w.WriteHeader(http.StatusOK)
@@ -216,19 +247,19 @@ func (s *Service) handleOrderSubmit(w http.ResponseWriter, r *http.Request, user
 		return
 	}
 
-	if err := s.Store.InsertOrder(user.ID, orderNumber); err != nil {
+	if err := s.Store.InsertOrder(ctx, user.ID, orderNumber); err != nil {
 		log.Printf("insert order: %v", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
-	if err := s.syncOrderStatus(orderNumber); err != nil {
+	if err := s.syncOrderStatus(ctx, orderNumber); err != nil {
 		log.Printf("sync accrual status for %s: %v", orderNumber, err)
 	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func (s *Service) handleOrderList(w http.ResponseWriter, user *storage.User) {
-	orders, err := s.Store.OrdersByUser(user.ID)
+func (s *Service) handleOrderList(ctx context.Context, w http.ResponseWriter, user *storage.User) {
+	orders, err := s.Store.OrdersByUser(ctx, user.ID)
 	if err != nil {
 		log.Printf("load orders: %v", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -262,7 +293,7 @@ func (s *Service) handleBalance(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	current, withdrawn, err := s.Store.Balance(userID)
+	current, withdrawn, err := s.Store.Balance(r.Context(), userID)
 	if err != nil {
 		log.Printf("query balance: %v", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -294,17 +325,11 @@ func (s *Service) handleWithdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	current, _, err := s.Store.Balance(userID)
-	if err != nil {
-		log.Printf("query balance: %v", err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
-		return
-	}
-	if current < request.Sum {
-		http.Error(w, "insufficient funds", http.StatusPaymentRequired)
-		return
-	}
-	if err := s.Store.InsertWithdrawal(userID, request.Order, request.Sum); err != nil {
+	if err := s.Store.Withdraw(r.Context(), userID, request.Order, request.Sum); err != nil {
+		if errors.Is(err, storage.ErrInsufficientFunds) {
+			http.Error(w, "insufficient funds", http.StatusPaymentRequired)
+			return
+		}
 		log.Printf("insert withdrawal: %v", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
@@ -318,7 +343,7 @@ func (s *Service) handleWithdrawals(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	items, err := s.Store.WithdrawalsByUser(userID)
+	items, err := s.Store.WithdrawalsByUser(r.Context(), userID)
 	if err != nil {
 		log.Printf("load withdrawals: %v", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -342,7 +367,7 @@ func (s *Service) handleWithdrawals(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Service) syncOrderStatus(orderNumber string) error {
+func (s *Service) syncOrderStatus(ctx context.Context, orderNumber string) error {
 	if s.Accrual == nil {
 		return nil
 	}
@@ -354,7 +379,7 @@ func (s *Service) syncOrderStatus(orderNumber string) error {
 	if status == "PROCESSED" && info.Accrual == nil {
 		status = "INVALID"
 	}
-	return s.Store.UpdateOrderStatus(orderNumber, status, info.Accrual)
+	return s.Store.UpdateOrderStatus(ctx, orderNumber, status, info.Accrual)
 }
 
 func normalizeAccrualStatus(status string) string {

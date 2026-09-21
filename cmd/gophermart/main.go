@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/knowe666/go-musthave-diploma-tpl/internal/accrual"
 	"github.com/knowe666/go-musthave-diploma-tpl/internal/api"
@@ -30,12 +34,14 @@ func main() {
 	defer db.Close()
 
 	store := storage.New(db)
-	if err := store.Init(); err != nil {
+	if err := store.Init(context.Background()); err != nil {
 		log.Fatalf("init database: %v", err)
 	}
 
 	service := api.New(store, auth.New(cfg.AuthSecret), accrual.New(cfg.AccrualAddress))
-	go service.SyncPendingOrders()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go service.SyncPendingOrders(ctx)
 
 	log.Printf("starting gophermart on %s", cfg.Address)
 	if err := http.ListenAndServe(cfg.Address, service.Router()); err != nil {

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -55,32 +56,35 @@ func Open(uri string) (*sql.DB, error) {
 }
 
 // Init создает схему, используемую сервисом, если она еще не существует.
-func (s *Store) Init() error {
+func (s *Store) Init(ctx context.Context) error {
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS users (
 			id TEXT PRIMARY KEY,
-			login TEXT UNIQUE NOT NULL,
-			password_hash TEXT NOT NULL,
+			login VARCHAR(100) UNIQUE NOT NULL,
+			password_hash VARCHAR(255) NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE TABLE IF NOT EXISTS orders (
-			id SERIAL PRIMARY KEY,
+			id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 			user_id TEXT NOT NULL REFERENCES users(id),
-			number TEXT UNIQUE NOT NULL,
+			number VARCHAR(50) UNIQUE NOT NULL,
 			status TEXT NOT NULL DEFAULT 'NEW',
 			accrual NUMERIC(18,2),
 			uploaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE TABLE IF NOT EXISTS withdrawals (
-			id SERIAL PRIMARY KEY,
+			id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 			user_id TEXT NOT NULL REFERENCES users(id),
-			order_number TEXT NOT NULL,
+			order_number VARCHAR(50) NOT NULL,
 			sum NUMERIC(18,2) NOT NULL,
 			processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_withdrawals_user_id ON withdrawals(user_id)`,
 	}
 	for _, query := range queries {
-		if _, err := s.DB.Exec(query); err != nil {
+		if _, err := s.DB.ExecContext(ctx, query); err != nil {
 			return err
 		}
 	}
@@ -88,15 +92,15 @@ func (s *Store) Init() error {
 }
 
 // CreateUser вставляет нового пользователя и возвращает его идентификатор базы данных.
-func (s *Store) CreateUser(userID, login, passwordHash string) error {
-	_, err := s.DB.Exec(`INSERT INTO users (id, login, password_hash) VALUES ($1, $2, $3)`, userID, login, passwordHash)
+func (s *Store) CreateUser(ctx context.Context, userID, login, passwordHash string) error {
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO users (id, login, password_hash) VALUES ($1, $2, $3)`, userID, login, passwordHash)
 	return err
 }
 
 // UserByLogin загружает пользователя по логину.
-func (s *Store) UserByLogin(login string) (*User, error) {
+func (s *Store) UserByLogin(ctx context.Context, login string) (*User, error) {
 	var user User
-	err := s.DB.QueryRow(`SELECT id, login, password_hash FROM users WHERE login = $1`, login).Scan(&user.ID, &user.Login, &user.PasswordHash)
+	err := s.DB.QueryRowContext(ctx, `SELECT id, login, password_hash FROM users WHERE login = $1`, login).Scan(&user.ID, &user.Login, &user.PasswordHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -107,9 +111,9 @@ func (s *Store) UserByLogin(login string) (*User, error) {
 }
 
 // UserByID загружает пользователя по идентификатору.
-func (s *Store) UserByID(userID string) (*User, error) {
+func (s *Store) UserByID(ctx context.Context, userID string) (*User, error) {
 	var user User
-	err := s.DB.QueryRow(`SELECT id, login, password_hash FROM users WHERE id = $1`, userID).Scan(&user.ID, &user.Login, &user.PasswordHash)
+	err := s.DB.QueryRowContext(ctx, `SELECT id, login, password_hash FROM users WHERE id = $1`, userID).Scan(&user.ID, &user.Login, &user.PasswordHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -120,22 +124,22 @@ func (s *Store) UserByID(userID string) (*User, error) {
 }
 
 // FindOrderByNumber возвращает пользователя и статус для номера заказа, если он присутствует.
-func (s *Store) FindOrderByNumber(number string) (string, string, error) {
+func (s *Store) FindOrderByNumber(ctx context.Context, number string) (string, string, error) {
 	var userID string
 	var status string
-	err := s.DB.QueryRow(`SELECT user_id, status FROM orders WHERE number = $1`, number).Scan(&userID, &status)
+	err := s.DB.QueryRowContext(ctx, `SELECT user_id, status FROM orders WHERE number = $1`, number).Scan(&userID, &status)
 	return userID, status, err
 }
 
 // InsertOrder сохраняет недавно отправленный заказ для пользователя.
-func (s *Store) InsertOrder(userID string, number string) error {
-	_, err := s.DB.Exec(`INSERT INTO orders (user_id, number, status, accrual) VALUES ($1, $2, 'NEW', NULL)`, userID, number)
+func (s *Store) InsertOrder(ctx context.Context, userID string, number string) error {
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO orders (user_id, number, status, accrual) VALUES ($1, $2, 'NEW', NULL)`, userID, number)
 	return err
 }
 
 // OrdersByUser загружает все заказы пользователя, отсортированные от новых к старым.
-func (s *Store) OrdersByUser(userID string) ([]Order, error) {
-	rows, err := s.DB.Query(`SELECT number, user_id, status, accrual, uploaded_at FROM orders WHERE user_id = $1 ORDER BY uploaded_at DESC`, userID)
+func (s *Store) OrdersByUser(ctx context.Context, userID string) ([]Order, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT number, user_id, status, accrual, uploaded_at FROM orders WHERE user_id = $1 ORDER BY uploaded_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -164,9 +168,9 @@ func (s *Store) OrdersByUser(userID string) ([]Order, error) {
 }
 
 // Balance рассчитывает текущие и выведенные итоги для пользователя.
-func (s *Store) Balance(userID string) (float64, float64, error) {
+func (s *Store) Balance(ctx context.Context, userID string) (float64, float64, error) {
 	var totalAccrual, totalWithdrawn sql.NullString
-	err := s.DB.QueryRow(`
+	err := s.DB.QueryRowContext(ctx, `
 		SELECT
 			COALESCE(SUM(CASE WHEN status = 'PROCESSED' AND accrual IS NOT NULL THEN accrual ELSE 0 END), 0),
 			COALESCE((SELECT SUM(sum) FROM withdrawals WHERE user_id = $1), 0)
@@ -186,14 +190,54 @@ func (s *Store) Balance(userID string) (float64, float64, error) {
 }
 
 // InsertWithdrawal сохраняет операцию снятия.
-func (s *Store) InsertWithdrawal(userID string, orderNumber string, sum float64) error {
-	_, err := s.DB.Exec(`INSERT INTO withdrawals (user_id, order_number, sum, processed_at) VALUES ($1, $2, $3, now())`, userID, orderNumber, sum)
+func (s *Store) InsertWithdrawal(ctx context.Context, userID string, orderNumber string, sum float64) error {
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO withdrawals (user_id, order_number, sum, processed_at) VALUES ($1, $2, $3, now())`, userID, orderNumber, sum)
 	return err
 }
 
+// Withdraw атомарно проверяет баланс и сохраняет операцию снятия.
+func (s *Store) Withdraw(ctx context.Context, userID string, orderNumber string, sum float64) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var lockedUserID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
+		return err
+	}
+
+	var totalAccrual, totalWithdrawn sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN status = 'PROCESSED' AND accrual IS NOT NULL THEN accrual ELSE 0 END), 0),
+			COALESCE((SELECT SUM(sum) FROM withdrawals WHERE user_id = $1), 0)
+		FROM orders WHERE user_id = $1`, userID).Scan(&totalAccrual, &totalWithdrawn)
+	if err != nil {
+		return err
+	}
+	current, err := parseNullableFloat(totalAccrual)
+	if err != nil {
+		return err
+	}
+	withdrawn, err := parseNullableFloat(totalWithdrawn)
+	if err != nil {
+		return err
+	}
+	if current-withdrawn < sum {
+		return ErrInsufficientFunds
+	}
+
+	if _, err := tx.ExecContext(ctx, `INSERT INTO withdrawals (user_id, order_number, sum, processed_at) VALUES ($1, $2, $3, now())`, userID, orderNumber, sum); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // WithdrawalsByUser загружает успешно обработанные снятия для пользователя, отсортированные новые в первую очередь.
-func (s *Store) WithdrawalsByUser(userID string) ([]Withdrawal, error) {
-	rows, err := s.DB.Query(`SELECT order_number, sum, processed_at FROM withdrawals WHERE user_id = $1 ORDER BY processed_at DESC`, userID)
+func (s *Store) WithdrawalsByUser(ctx context.Context, userID string) ([]Withdrawal, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT order_number, sum, processed_at FROM withdrawals WHERE user_id = $1 ORDER BY processed_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -214,8 +258,8 @@ func (s *Store) WithdrawalsByUser(userID string) ([]Withdrawal, error) {
 }
 
 // PendingOrders возвращает заказы, требующие проверки обновления статуса.
-func (s *Store) PendingOrders() ([]string, error) {
-	rows, err := s.DB.Query(`SELECT number FROM orders WHERE status IN ('NEW', 'PROCESSING') ORDER BY uploaded_at ASC`)
+func (s *Store) PendingOrders(ctx context.Context) ([]string, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT number FROM orders WHERE status IN ('NEW', 'PROCESSING') ORDER BY uploaded_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -236,12 +280,12 @@ func (s *Store) PendingOrders() ([]string, error) {
 }
 
 // UpdateOrderStatus обновляет сохраненный статус обработки и данные начисления.
-func (s *Store) UpdateOrderStatus(orderNumber, status string, accrual *float64) error {
+func (s *Store) UpdateOrderStatus(ctx context.Context, orderNumber, status string, accrual *float64) error {
 	if accrual == nil {
-		_, err := s.DB.Exec(`UPDATE orders SET status = $1, accrual = NULL WHERE number = $2`, status, orderNumber)
+		_, err := s.DB.ExecContext(ctx, `UPDATE orders SET status = $1, accrual = NULL WHERE number = $2`, status, orderNumber)
 		return err
 	}
-	_, err := s.DB.Exec(`UPDATE orders SET status = $1, accrual = $2 WHERE number = $3`, status, *accrual, orderNumber)
+	_, err := s.DB.ExecContext(ctx, `UPDATE orders SET status = $1, accrual = $2 WHERE number = $3`, status, *accrual, orderNumber)
 	return err
 }
 
@@ -258,3 +302,5 @@ func parseNullableFloat(value sql.NullString) (float64, error) {
 
 // ErrNoRows возвращается, когда поиск по логину или id не нашел запись.
 var ErrNoRows = errors.New("no rows found")
+
+var ErrInsufficientFunds = errors.New("insufficient funds")
