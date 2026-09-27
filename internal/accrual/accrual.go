@@ -1,6 +1,7 @@
 package accrual
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,13 +49,17 @@ func New(baseURL string) *Client {
 }
 
 // FetchOrder получает текущие данные начисления баллов для конкретного заказа.
-func (c *Client) FetchOrder(orderNumber string) (*OrderInfo, error) {
+func (c *Client) FetchOrder(ctx context.Context, orderNumber string) (*OrderInfo, error) {
 	if c == nil || c.BaseURL == "" {
 		return nil, fmt.Errorf("accrual service is not configured")
 	}
 	url := c.BaseURL + "/api/orders/" + orderNumber
 	for retry := 0; retry <= maxRetries; retry++ {
-		resp, err := c.HTTPClient.Get(url)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.HTTPClient.Do(req)
 		if err != nil {
 			return nil, err
 		}
@@ -76,7 +81,11 @@ func (c *Client) FetchOrder(orderNumber string) (*OrderInfo, error) {
 		}
 
 		if resp.StatusCode >= http.StatusInternalServerError && retry < maxRetries {
-			time.Sleep(time.Second << retry)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Second << retry):
+			}
 			continue
 		}
 		return nil, fmt.Errorf("accrual request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))

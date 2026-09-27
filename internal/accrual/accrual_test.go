@@ -1,6 +1,7 @@
 package accrual
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -24,12 +25,26 @@ func TestFetchOrderRateLimit(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := New(server.URL).FetchOrder("123")
+	_, err := New(server.URL).FetchOrder(context.Background(), "123")
 	var rateLimitErr *RateLimitError
 	if !errors.As(err, &rateLimitErr) {
 		t.Fatalf("FetchOrder() error = %v, want RateLimitError", err)
 	}
 	if rateLimitErr.RetryAfter != 7*time.Second {
 		t.Fatalf("RetryAfter = %s, want 7s", rateLimitErr.RetryAfter)
+	}
+}
+
+func TestFetchOrderCancellationDuringRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		cancel()
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL).FetchOrder(ctx, "123")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("FetchOrder() error = %v, want context.Canceled", err)
 	}
 }

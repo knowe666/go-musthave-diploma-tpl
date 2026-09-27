@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,13 +21,27 @@ import (
 
 // Service является точкой входа HTTP API для сервиса gophermart.
 type Service struct {
-	Store   *storage.Store
+	Store   Store
 	Auth    *auth.Authenticator
 	Accrual *accrual.Client
 }
 
+type Store interface {
+	UserByLogin(context.Context, string) (*storage.User, error)
+	UserByID(context.Context, string) (*storage.User, error)
+	CreateUser(context.Context, string, string, string) error
+	FindOrderByNumber(context.Context, string) (string, string, error)
+	InsertOrder(context.Context, string, string) error
+	OrdersByUser(context.Context, string) ([]storage.Order, error)
+	Balance(context.Context, string) (float64, float64, error)
+	Withdraw(context.Context, string, string, float64) error
+	WithdrawalsByUser(context.Context, string) ([]storage.Withdrawal, error)
+	PendingOrders(context.Context) ([]string, error)
+	UpdateOrderStatus(context.Context, string, string, *float64) error
+}
+
 // New создает экземпляр сервиса, который связывает зависимости storage, auth и accrual.
-func New(store *storage.Store, authn *auth.Authenticator, client *accrual.Client) *Service {
+func New(store Store, authn *auth.Authenticator, client *accrual.Client) *Service {
 	return &Service{Store: store, Auth: authn, Accrual: client}
 }
 
@@ -53,6 +68,7 @@ func (s *Service) SyncPendingOrders(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	var nextAccrualRequest time.Time
+	var nextAccrualRequestMu sync.Mutex
 	for {
 		select {
 		case <-ctx.Done():
@@ -65,19 +81,35 @@ func (s *Service) SyncPendingOrders(ctx context.Context) {
 			log.Printf("query pending orders: %v", err)
 			continue
 		}
+		var wg sync.WaitGroup
 		for _, number := range orders {
-			if !waitForAccrual(ctx, nextAccrualRequest) {
-				return
-			}
-			err := s.syncOrderStatus(ctx, number)
-			if err != nil {
-				log.Printf("sync order %s: %v", number, err)
-				var rateLimitErr *accrual.RateLimitError
-				if errors.As(err, &rateLimitErr) && rateLimitErr.RetryAfter > 0 {
-					nextAccrualRequest = time.Now().Add(rateLimitErr.RetryAfter)
+			wg.Add(1)
+			go func(orderNumber string) {
+				defer wg.Done()
+
+				nextAccrualRequestMu.Lock()
+				deadline := nextAccrualRequest
+				nextAccrualRequestMu.Unlock()
+				if !waitForAccrual(ctx, deadline) {
+					return
 				}
-			}
+
+				err := s.syncOrderStatus(ctx, orderNumber)
+				if err != nil {
+					log.Printf("sync order %s: %v", orderNumber, err)
+					var rateLimitErr *accrual.RateLimitError
+					if errors.As(err, &rateLimitErr) && rateLimitErr.RetryAfter > 0 {
+						nextAccrualRequestMu.Lock()
+						deadline := time.Now().Add(rateLimitErr.RetryAfter)
+						if deadline.After(nextAccrualRequest) {
+							nextAccrualRequest = deadline
+						}
+						nextAccrualRequestMu.Unlock()
+					}
+				}
+			}(number)
 		}
+		wg.Wait()
 	}
 }
 
@@ -180,7 +212,7 @@ func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user, err := s.Store.UserByLogin(r.Context(), request.Login)
-	if errors.Is(err, sql.ErrNoRows) || err != nil && user == nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "invalid login or password", http.StatusUnauthorized)
 		return
 	}
@@ -196,28 +228,6 @@ func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	s.Auth.SetUserCookie(w, user.ID)
 	w.WriteHeader(http.StatusOK)
-}
-
-func (s *Service) handleOrders(w http.ResponseWriter, r *http.Request) {
-	userID, err := s.Auth.UserIDFromRequest(r)
-	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	user, err := s.Store.UserByID(r.Context(), userID)
-	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	switch r.Method {
-	case http.MethodPost:
-		s.handleOrderSubmit(r.Context(), w, r, user)
-	case http.MethodGet:
-		s.handleOrderList(r.Context(), w, user)
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
 }
 
 func (s *Service) handleOrderSubmit(ctx context.Context, w http.ResponseWriter, r *http.Request, user *storage.User) {
@@ -371,7 +381,7 @@ func (s *Service) syncOrderStatus(ctx context.Context, orderNumber string) error
 	if s.Accrual == nil {
 		return nil
 	}
-	info, err := s.Accrual.FetchOrder(orderNumber)
+	info, err := s.Accrual.FetchOrder(ctx, orderNumber)
 	if err != nil {
 		return err
 	}

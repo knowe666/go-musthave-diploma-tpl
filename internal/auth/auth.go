@@ -1,15 +1,11 @@
 package auth
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"net/http"
-	"strings"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -41,23 +37,16 @@ func GenerateUserID() string {
 	return uuid.New().String()
 }
 
-// signUserID создает подпись для userID
-func (a *Authenticator) signUserID(userID string) string {
-	mac := hmac.New(sha256.New, a.secretKey)
-	mac.Write([]byte(userID))
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-// verifySignature проверяет подпись userID
-func (a *Authenticator) verifySignature(userID, signature string) bool {
-	expected := a.signUserID(userID)
-	return hmac.Equal([]byte(expected), []byte(signature))
-}
-
-// SetUserCookie устанавливает подписанную куку с userID
+// SetUserCookie устанавливает подписанную куку с userID и сроком действия.
 func (a *Authenticator) SetUserCookie(w http.ResponseWriter, userID string) {
-	signature := a.signUserID(userID)
-	cookieValue := base64.URLEncoding.EncodeToString([]byte(userID + ":" + signature))
+	claims := jwt.RegisteredClaims{
+		Subject:   userID,
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(cookieMaxAge) * time.Second)),
+	}
+	cookieValue, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(a.secretKey)
+	if err != nil {
+		return
+	}
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
@@ -70,37 +59,25 @@ func (a *Authenticator) SetUserCookie(w http.ResponseWriter, userID string) {
 	})
 }
 
-// GetUserIDFromCookie извлекает и проверяет userID из куки
+// GetUserIDFromCookie извлекает userID и проверяет подпись и срок действия токена.
 func (a *Authenticator) GetUserIDFromCookie(r *http.Request) (string, error) {
 	cookie, err := r.Cookie(cookieName)
 	if err != nil {
 		if errors.Is(err, http.ErrNoCookie) {
 			return "", ErrNoCookie
 		}
-		return "", fmt.Errorf("failed to get cookie: %w", err)
-	}
-
-	// Декодируем значение
-	decoded, err := base64.URLEncoding.DecodeString(cookie.Value)
-	if err != nil {
 		return "", ErrInvalidCookie
 	}
 
-	// Разделяем userID и подпись
-	parts := strings.SplitN(string(decoded), ":", 2)
-	if len(parts) != 2 {
+	claims := &jwt.RegisteredClaims{}
+	token, err := jwt.ParseWithClaims(cookie.Value, claims, func(token *jwt.Token) (any, error) {
+		return a.secretKey, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
+	if err != nil || !token.Valid || claims.Subject == "" {
 		return "", ErrInvalidCookie
 	}
 
-	userID := parts[0]
-	signature := parts[1]
-
-	// Проверяем подпись
-	if !a.verifySignature(userID, signature) {
-		return "", ErrInvalidCookie
-	}
-
-	return userID, nil
+	return claims.Subject, nil
 }
 
 // UserIDFromRequest возвращает userID из куки
